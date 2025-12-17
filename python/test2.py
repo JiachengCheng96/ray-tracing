@@ -1,75 +1,33 @@
 import open3d as o3d
 import numpy as np
-import requests
-import io
-import trimesh
-import matplotlib.pyplot as plt
 import time
+from utils import load_bunny_mesh, create_pixel_grid, plot_heatmap
 
-def load_bunny_mesh(target_triangles=2000):
-    """
-    Downloads Stanford Bunny, converts to Open3D, and simplifies it for performance.
-    """
-    print("1. Loading Stanford Bunny...")
-    url = "https://raw.githubusercontent.com/mikedh/trimesh/master/models/bunny.ply"
-    try:
-        data = requests.get(url).content
-        mesh_tri = trimesh.load(io.BytesIO(data), file_type='ply')
-    except Exception as e:
-        print(f"   Download failed ({e}), creating sphere instead.")
-        mesh_tri = trimesh.creation.icosphere(subdivisions=3)
+# --- PARAMETERS ---
+target_triangles = 5000       # Mesh simplification target
+check_occlusion = False
+num_vis = 45    
 
-    # Convert to Open3D
-    mesh = o3d.geometry.TriangleMesh()
-    mesh.vertices = o3d.utility.Vector3dVector(mesh_tri.vertices)
-    mesh.triangles = o3d.utility.Vector3iVector(mesh_tri.faces)
-    mesh.compute_vertex_normals()
-    
-    # Simplify mesh to speed up the O(N*M) reflection check
-    print(f"   Original triangles: {len(mesh.triangles)}")
-    mesh = mesh.simplify_quadric_decimation(target_number_of_triangles=target_triangles)
-    mesh.compute_vertex_normals()
-    mesh.compute_triangle_normals()
-    print(f"   Simplified triangles: {len(mesh.triangles)}")
-    
-    # Center and scale
-    center = mesh.get_center()
-    mesh.translate(-center)
-    scale = 1.0 / np.max(mesh.get_max_bound() - mesh.get_min_bound())
-    mesh.scale(scale, center=[0,0,0])
-    
-    return mesh
+source_points = [
+    np.array([2.5, 2.3, 1.4]),
+    np.array([2.5, 2.35, 1.4]),
+    np.array([2.5, 2.4, 1.40]),
+    np.array([2.5, 2.45, 1.40]),
+    np.array([2.5, 2.5, 1.45]),
+    np.array([2.5, 2.5, 1.5]),
+    np.array([2.5, 2.5, 1.55]),
+    np.array([2.5, 2.5, 1.6])
+]
 
-def create_pixel_grid(center, normal, up, width, height, resolution_x, resolution_y, verbose=True):
-    """
-    Creates a grid of 3D points representing pixels on a virtual screen defined by position and orientation.
-    """
-    if verbose:
-        print(f"2. Creating Pixel Grid ({resolution_x}x{resolution_y})...")
-    
-    # Normalize vectors
-    normal = normal / np.linalg.norm(normal)
-    up = up / np.linalg.norm(up)
-    
-    # Calculate Right vector
-    right = np.cross(normal, up)
-    right /= np.linalg.norm(right)
-    
-    # Recompute Up to ensure orthogonality
-    true_up = np.cross(right, normal)
-    
-    half_width = width / 2.0
-    half_height = height / 2.0
-    
-    # Generate grid
-    xs = np.linspace(-half_width, half_width, resolution_x)
-    ys = np.linspace(half_height, -half_height, resolution_y) # Top to bottom
-    xx, yy = np.meshgrid(xs, ys)
-    
-    # Grid points in World Space
-    grid_points = center + (xx[..., np.newaxis] * right) + (yy[..., np.newaxis] * true_up)
-    
-    return grid_points.reshape(-1, 3)
+# Grid settings
+grid_center = np.array([1.5, 3.6, 5.4])   # Center of the pixel grid
+grid_normal = np.array([-0.2, -0.5, -0.8]) # Direction the grid is facing (towards scene)
+grid_up     = np.array([0.0, 1.0, 0.0])   # Up vector
+grid_width  = 2.0
+grid_height = 2.0
+
+res_x   = 30                  # Horizontal resolution
+res_y   = 30                  # Vertical resolution
 
 def compute_reflections(mesh, source_point, grid_center, grid_normal, grid_up, grid_width, grid_height, res_x, res_y, samples=4, check_occlusion=False):
     """
@@ -293,43 +251,9 @@ def compute_reflections(mesh, source_point, grid_center, grid_normal, grid_up, g
     
     return list(zip(valid_Pixels, valid_P)), heatmap
 
-def plot_heatmap(heatmap):
-    plt.figure(figsize=(6, 5))
-    plt.imshow(heatmap, cmap='jet', interpolation='nearest')
-    plt.colorbar(label='Hit Count')
-    plt.title('Ray Hits per Pixel')
-    plt.xlabel('Pixel X')
-    plt.ylabel('Pixel Y')
-    plt.show(block=False)
-    plt.pause(0.1)
-
 def main():
     t0 = time.time()
-    # --- PARAMETERS ---
-    target_triangles = 15000       # Mesh simplification target
-    check_occlusion = False
-    num_vis = 45    
 
-    source_points = [
-        np.array([2.5, 2.3, 1.4]),
-        np.array([2.5, 2.35, 1.4]),
-        np.array([2.5, 2.4, 1.40]),
-        np.array([2.5, 2.45, 1.40]),
-        np.array([2.5, 2.5, 1.45]),
-        np.array([2.5, 2.5, 1.5]),
-        np.array([2.5, 2.5, 1.55]),
-        np.array([2.5, 2.5, 1.6])
-    ]
-    
-    # Grid settings
-    grid_center = np.array([1.5, 3.6, 5.4])   # Center of the pixel grid
-    grid_normal = np.array([-0.2, -0.5, -0.8]) # Direction the grid is facing (towards scene)
-    grid_up     = np.array([0.0, 1.0, 0.0])   # Up vector
-    grid_width  = 2.0
-    grid_height = 2.0
-    
-    res_x   = 30                  # Horizontal resolution
-    res_y   = 30                  # Vertical resolution
     # ------------------
     # 1. Setup
     mesh = load_bunny_mesh(target_triangles=target_triangles)
@@ -368,7 +292,7 @@ def main():
     for sp in source_points:
         light_geo = o3d.geometry.TriangleMesh.create_sphere(radius=0.02)
         light_geo.translate(sp)
-        light_geo.paint_uniform_color([1, 1, 0])
+        light_geo.paint_uniform_color([1, 0.4, 0])
         geometries.append(light_geo)
     
     # B. Draw Pixel Grid (Blue Points)
