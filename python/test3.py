@@ -6,44 +6,50 @@ from utils import load_bunny_mesh, create_pixel_grid, plot_heatmap, create_groun
 
 
 
+print(o3d.__version__)
+# print(o3d.__doc__)
+print(o3d.core.get_3rdparty_library_info())
 # --- CONFIGURATION ---
 
-num_samples_per_source = 10000000
+num_samples_per_source=10000000
 
-
-target_triangles = 4*250000       # Mesh simplification target
+target_triangles = int(2e9)       # Mesh simplification target
 check_occlusion = False
-num_vis = 100    
+num_vis = 50    
 
-source_center = np.array([3.5, 3.3, 2.4])
-spacing_size = 0.1
+source_center = np.array([3., .5, .5]) / 1
+spacing_size = 0.01
 source_points = [
     source_center + spacing_size * np.array([1., .0, .0]),
-    source_center + spacing_size * np.array([2., .0, .0]),
-    source_center + spacing_size * np.array([3., .0, .0]),
-    source_center + spacing_size * np.array([4., .0, .0]),
+    # source_center + spacing_size * np.array([2., .0, .0]),
+    # source_center + spacing_size * np.array([3., .0, .0]),
+    # source_center + spacing_size * np.array([4., .0, .0]),
 
-    source_center + spacing_size * np.array([.0, 1., .0]),
-    source_center + spacing_size * np.array([.0, 2., .0]),
-    source_center + spacing_size * np.array([.0, 3., .0]),
-    source_center + spacing_size * np.array([.0, 4., .0]),
+    # source_center + spacing_size * np.array([.0, 1., .0]),
+    # source_center + spacing_size * np.array([.0, 2., .0]),
+    # source_center + spacing_size * np.array([.0, 3., .0]),
+    # source_center + spacing_size * np.array([.0, 4., .0]),
     
-    source_center + spacing_size * np.array([.0, .0, 1.]),
-    source_center + spacing_size * np.array([.0, .0, 2.]),
-    source_center + spacing_size * np.array([.0, .0, 3.]),
-    source_center + spacing_size * np.array([.0, .0, 4.]),
+    # source_center + spacing_size * np.array([.0, .0, 1.]),
+    # source_center + spacing_size * np.array([.0, .0, 2.]),
+    # source_center + spacing_size * np.array([.0, .0, 3.]),
+    # source_center + spacing_size * np.array([.0, .0, 4.]),
 
 ]
 
 # Grid settings
-grid_center = np.array([1.5, 3.6, 5.4])   # Center of the pixel grid
+grid_center = np.array([1.5, 3.6, 3.6]) /3  # Center of the pixel grid
 grid_normal = np.array([-0.2, -0.5, -0.8]) # Direction the grid is facing (towards scene)
 grid_up     = np.array([0.0, 1.0, 0.0])   # Up vector
-grid_width  = 2.0
-grid_height = 2.0
+grid_width  = 0.5
+grid_height = 0.5
 
-res_x   = 50                  # Horizontal resolution
-res_y   = 50                  # Vertical resolution
+pixel_size = 0.5 # unit: cm
+
+# (grid_width * 180) cm = pixel_size * res_x
+# res_x = pixel_size * 180/1  
+res_x   = int((grid_width * 180) / pixel_size) #                 # Horizontal resolution
+res_y   = int((grid_height * 180) / pixel_size)                  # Vertical resolution
 
 def compute_reflections_forward(mesh, source_points, grid_center, grid_normal, grid_up, grid_width, grid_height, res_x, res_y, num_samples=100000, check_occlusion=False):
     """
@@ -73,13 +79,12 @@ def compute_reflections_forward(mesh, source_points, grid_center, grid_normal, g
     
     heatmap = np.zeros((res_y, res_x), dtype=np.int32)
     all_paths = []
+    hit_triangle_indices = set()
     
-    # Setup Scene for Occlusion if needed (once)
-    scene = None
-    if check_occlusion:
-        t_mesh = o3d.t.geometry.TriangleMesh.from_legacy(mesh)
-        scene = o3d.t.geometry.RaycastingScene()
-        scene.add_triangles(t_mesh)
+    # Setup Scene for Occlusion and Triangle ID retrieval (Always needed)
+    t_mesh = o3d.t.geometry.TriangleMesh.from_legacy(mesh)
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(t_mesh)
         
     for source_point in source_points:
         # --- B. Culling (Back-face) ---
@@ -203,9 +208,22 @@ def compute_reflections_forward(mesh, source_points, grid_center, grid_normal, g
             # Store paths: (Source, Hit, Bounce)
             for i in range(len(valid_P)):
                 all_paths.append((source_point, valid_Hit[i], valid_P[i]))
+
+            # Identify triangles for valid_P
+            dirs = valid_P - source_point
+            dists = np.linalg.norm(dirs, axis=1)
+            dirs /= (dists[:, None] + 1e-6)
+            
+            rays = np.concatenate([np.tile(source_point, (len(valid_P), 1)), dirs], axis=1).astype(np.float32)
+            hits = scene.cast_rays(o3d.core.Tensor(rays))
+            prim_ids = hits['primitive_ids'].numpy()
+            
+            # Filter valid hits (Open3D uses 0xFFFFFFFF for invalid)
+            valid_ids = prim_ids[prim_ids != 0xFFFFFFFF]
+            hit_triangle_indices.update(valid_ids)
     
     print(f"   Confirmed {len(all_paths)} valid paths across all sources.")
-    return all_paths, heatmap
+    return all_paths, heatmap, hit_triangle_indices
 
 
 def main():
@@ -214,21 +232,90 @@ def main():
   
     
     # 1. Load Mesh
-    mesh = load_bunny_mesh(target_triangles=target_triangles)
-    
-    # Add a second bunny
-    mesh2 = copy.deepcopy(mesh)
-    R2 = mesh2.get_rotation_matrix_from_xyz((0, -np.pi / 3, 0))
-    mesh2.rotate(R2, center=(0, 0, 0))
-    mesh2.translate([-0.7, 0.0, 0.5])
+    # Load a human mesh (e.g., 'human.obj') or fallback to Armadillo
 
-    R = mesh.get_rotation_matrix_from_xyz((0, np.pi / 4, 0))
-    mesh.rotate(R, center=(0, 0, 0))
-    mesh.translate([0.7, 0.0, 0.5])
-    mesh += mesh2
+    # mesh = load_bunny_mesh(target_triangles=target_triangles)
+
+    # mesh_path = "/Users/jiacheng/GitHub/ray-tracing/python/Human.obj"
+    mesh_path = "triangulated.obj"
+
+    mesh = o3d.io.read_triangle_mesh(mesh_path)
+
+
+
+    # target_tris = 50000
+    # mesh_dec = mesh.simplify_quadric_decimation(target_number_of_triangles=target_tris)
+
+    # # Optional cleanup
+    # mesh_dec.remove_duplicated_vertices()
+    # mesh_dec.remove_duplicated_triangles()
+    # mesh_dec.remove_degenerate_triangles()
+    # mesh_dec.remove_non_manifold_edges()
+
+
+    # --- Measure height BEFORE normalization ---
+    bbox_original = mesh.get_axis_aligned_bounding_box()
+    dimensions_original = bbox_original.get_extent()
+    print(f"Original Mesh Dimensions (X, Y, Z): {dimensions_original[0]:.4f}, {dimensions_original[1]:.4f}, {dimensions_original[2]:.4f}")
+    print(f"Original Mesh Height (Y-axis): {dimensions_original[1]:.4f} units")
+
+
+    # import trimesh
+    # mesh = trimesh.load("Male.OBJ", process=True)
+    # # mesh = mesh.triangulate()
+    # mesh.export("triangulated.obj")
+
+
+    # mesh = o3d.io.read_triangle_mesh(mesh_path)
+
+    # print(mesh)
+    # print('Vertices:')
+    # print(np.asarray(mesh.vertices))
+    # print('Triangles:')
+    # print(np.asarray(mesh.triangles))
+
+    # # Alternative: Load as a PointCloud if you only need the geometry
+    # pcd = o3d.io.read_point_cloud("Human.obj")
+    # o3d.visualization.draw_geometries([pcd])
+
+    # if not mesh.has_vertices():
+    #     raise FileNotFoundError(f"File {mesh_path} not found or empty.")
+    
+
+    # Normalize mesh (Center and Scale)
+    mesh.compute_vertex_normals()
+    mesh.translate(-mesh.get_center())
+    
+    # Scale to approx 1.0 unit size to match scene scale
+    bbox = mesh.get_axis_aligned_bounding_box()
+    max_extent = bbox.get_max_extent()
+    if max_extent > 0:
+        mesh.scale(1.0 / max_extent, center=(0, 0, 0))
+
+    # --- Measure height AFTER normalization ---
+    bbox_normalized = mesh.get_axis_aligned_bounding_box()
+    dimensions_normalized = bbox_normalized.get_extent()
+    print(f"\nNormalized Mesh Dimensions (X, Y, Z): {dimensions_normalized[0]:.4f}, {dimensions_normalized[1]:.4f}, {dimensions_normalized[2]:.4f}")
+    print(f"Normalized Mesh Height (Y-axis): {dimensions_normalized[1]:.4f} units\n")
+    print(f'mesh.triangles={len(mesh.triangles)}')
+    # 1 unit: 1.8m 
+    # Simplify
+    if len(mesh.triangles) > target_triangles:
+        mesh = mesh.simplify_quadric_decimation(target_number_of_triangles=target_triangles)
+    
+    # # Add a second bunny
+    # mesh2 = copy.deepcopy(mesh)
+    # R2 = mesh2.get_rotation_matrix_from_xyz((0, -np.pi / 3, 0))
+    # mesh2.rotate(R2, center=(0, 0, 0))
+    # mesh2.translate([-0.7, 0.0, 0.5])
+
+    # R = mesh.get_rotation_matrix_from_xyz((0, np.pi / 4, 0))
+    # mesh.rotate(R, center=(0, 0, 0))
+    # mesh.translate([0.7, 0.0, 0.5])
+    # mesh += mesh2
     
     # 2. Compute Reflections
-    all_paths, total_heatmap = compute_reflections_forward(
+    all_paths, total_heatmap, hit_tri_indices = compute_reflections_forward(
         mesh, source_points, grid_center, grid_normal, grid_up, grid_width, grid_height, 
         res_x, res_y, num_samples=num_samples_per_source, check_occlusion=check_occlusion
     )
@@ -238,6 +325,18 @@ def main():
     plot_heatmap(total_heatmap, save_path=filename, title_str=f'Ray Hits per Pixel (samples_per_triangle={num_samples_per_source:.1E})')
     
     # 3. Visualize 3D
+    # Paint mesh grey
+    mesh.paint_uniform_color([0.5, 0.5, 0.5])
+    
+    # Paint hit triangles green
+    if hit_tri_indices:
+        triangles = np.asarray(mesh.triangles)
+        hit_tri_array = triangles[list(hit_tri_indices)]
+        hit_vertices = np.unique(hit_tri_array)
+        colors = np.asarray(mesh.vertex_colors)
+        colors[hit_vertices] = [0, 1, 0] # Green
+        mesh.vertex_colors = o3d.utility.Vector3dVector(colors)
+
     geometries = [mesh]
     # Add grid points for context
     grid_pts = create_pixel_grid(grid_center, grid_normal, grid_up, grid_width, grid_height, res_x, res_y, verbose=False)
@@ -279,7 +378,13 @@ def main():
         ls.colors = o3d.utility.Vector3dVector(colors)
         geometries.append(ls)
         
-    o3d.visualization.draw_geometries(geometries, window_name="Forward Ray Tracing")
+    vis=o3d.visualization.draw_geometries(geometries, window_name="Forward Ray Tracing")
+
+    def close_on_enter(vis):
+        vis.close()
+        return False
+
+    vis.register_key_callback(13, close_on_enter)   # try 13, or 257/335 if needed
 
 if __name__ == "__main__":
     main()
