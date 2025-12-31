@@ -8,10 +8,9 @@ from utils import load_bunny_mesh, create_pixel_grid, plot_heatmap, create_groun
 
 print(o3d.__version__)
 # print(o3d.__doc__)
-# print(o3d.core.get_3rdparty_library_info())
 # --- CONFIGURATION ---
 
-num_samples_per_source=10000000
+num_samples_per_source=2100000
 
 target_triangles = int(2e9)       # Mesh simplification target
 check_occlusion = False
@@ -62,19 +61,29 @@ def compute_reflections_forward(mesh, source_points, grid_center, grid_normal, g
     """
     print(f"3. Computing Reflections (Forward Tracing) with {num_samples} rays for {len(source_points)} sources...")
     
+    # Use CPU for everything
+    device = o3d.core.Device("cpu:0")
+    print(f"   Using Device: {device}")
+
     # Ensure source_points is iterable
     if isinstance(source_points, np.ndarray) and source_points.ndim == 1:
         source_points = [source_points]
     
     # --- A. Sample Mesh ---
     pcd = mesh.sample_points_uniformly(number_of_points=num_samples)
-    P = np.asarray(pcd.points)
-    N = np.asarray(pcd.normals)
+    
+    # Convert to Open3D Tensors
+    P = o3d.core.Tensor(np.asarray(pcd.points), dtype=o3d.core.float32, device=device)
+    N = o3d.core.Tensor(np.asarray(pcd.normals), dtype=o3d.core.float32, device=device)
+    
+    # Constants to Tensor
+    grid_center_t = o3d.core.Tensor(grid_center, dtype=o3d.core.float32, device=device)
+    grid_normal_t = o3d.core.Tensor(grid_normal, dtype=o3d.core.float32, device=device)
     
     # Pre-calculate Sensor Culling (independent of light source)
     # Vector from Surface to Sensor Center
-    vec_to_sensor = grid_center - P
-    dot_sensor = np.einsum('ij,ij->i', N, vec_to_sensor)
+    vec_to_sensor = grid_center_t - P
+    dot_sensor = (N * vec_to_sensor).sum(dim=1)
     sensor_visible_mask = dot_sensor > 1e-6
     
     heatmap = np.zeros((res_y, res_x), dtype=np.int32)
@@ -82,21 +91,33 @@ def compute_reflections_forward(mesh, source_points, grid_center, grid_normal, g
     hit_triangle_indices = set()
     
     # Setup Scene for Occlusion and Triangle ID retrieval (Always needed)
-    t_mesh = o3d.t.geometry.TriangleMesh.from_legacy(mesh)
-    scene = o3d.t.geometry.RaycastingScene()
+    t_mesh = o3d.t.geometry.TriangleMesh.from_legacy(mesh).to(device)
+    scene = o3d.t.geometry.RaycastingScene(device=device)
     scene.add_triangles(t_mesh)
+    
+    # Pre-calculate Grid Basis on CPU, then move to Tensor
+    gn = grid_normal / np.linalg.norm(grid_normal)
+    gu = grid_up / np.linalg.norm(grid_up)
+    gr = np.cross(gn, gu)
+    gr /= np.linalg.norm(gr)
+    gtu = np.cross(gr, gn)
+    
+    gr_t = o3d.core.Tensor(gr, dtype=o3d.core.float32, device=device)
+    gtu_t = o3d.core.Tensor(gtu, dtype=o3d.core.float32, device=device)
         
     for source_point in source_points:
+        source_point_t = o3d.core.Tensor(source_point, dtype=o3d.core.float32, device=device)
+        
         # --- B. Culling (Back-face) ---
         # Vector from Surface to Source
-        vec_to_source = source_point - P
+        vec_to_source = source_point_t - P
         # Dot product > 0 means surface faces light
-        dot_source = np.einsum('ij,ij->i', N, vec_to_source)
+        dot_source = (N * vec_to_source).sum(dim=1)
         
         # Combine with pre-calculated sensor mask
         valid_mask = (dot_source > 1e-6) & sensor_visible_mask
         
-        if np.sum(valid_mask) == 0:
+        if not valid_mask.any():
             continue
 
         P_curr = P[valid_mask]
@@ -104,25 +125,25 @@ def compute_reflections_forward(mesh, source_points, grid_center, grid_normal, g
         
         # --- C. Calculate Reflection ---
         # Incoming direction D_in (from Source to P)
-        D_in = P_curr - source_point
-        dist_in = np.linalg.norm(D_in, axis=1)
-        D_in /= (dist_in[:, np.newaxis] + 1e-6)
+        D_in = P_curr - source_point_t
+        dist_in = (D_in * D_in).sum(dim=1).sqrt()
+        D_in = D_in / (dist_in.reshape((-1, 1)) + 1e-6)
         
         # Reflection R = D_in - 2(D_in . N)N
-        dot_ref = np.einsum('ij,ij->i', D_in, N_curr)
-        R = D_in - 2 * dot_ref[:, np.newaxis] * N_curr
+        dot_ref = (D_in * N_curr).sum(dim=1)
+        R = D_in - 2 * dot_ref.reshape((-1, 1)) * N_curr
         
         # --- D. Intersect with Sensor Plane ---
         # Plane: dot(x - Center, Normal) = 0
         # Ray: x = P + t*R
         # t = dot(Center - P, Normal) / dot(R, Normal)
         
-        denom = np.einsum('ij,j->i', R, grid_normal)
+        denom = (R * grid_normal_t).sum(dim=1)
         
         # Ray must hit plane from the front (opposing normal)
         valid_denom = denom < -1e-6
         
-        t = np.einsum('ij,j->i', grid_center - P_curr, grid_normal) / (denom + 1e-10)
+        t = ((grid_center_t - P_curr) * grid_normal_t).sum(dim=1) / (denom + 1e-10)
         
         # Check t > 0 (hit is forward)
         valid_t = (t > 0) & valid_denom
@@ -131,22 +152,18 @@ def compute_reflections_forward(mesh, source_points, grid_center, grid_normal, g
         P_curr = P_curr[valid_t]
         R = R[valid_t]
         t = t[valid_t]
-        Hit = P_curr + t[:, np.newaxis] * R
+        Hit = P_curr + t.reshape((-1, 1)) * R
         
         # --- E. Project to 2D Grid Coords ---
         # Recompute Grid Basis
-        gn = grid_normal / np.linalg.norm(grid_normal)
-        gu = grid_up / np.linalg.norm(grid_up)
-        gr = np.cross(gn, gu)
-        gr /= np.linalg.norm(gr)
-        gtu = np.cross(gr, gn) # True Up
+        # (Already done outside loop)
         
-        V = Hit - grid_center
-        x_local = np.einsum('ij,j->i', V, gr)
-        y_local = np.einsum('ij,j->i', V, gtu)
+        V = Hit - grid_center_t
+        x_local = (V * gr_t).sum(dim=1)
+        y_local = (V * gtu_t).sum(dim=1)
         
         # Check bounds
-        in_bounds = (np.abs(x_local) <= grid_width/2) & (np.abs(y_local) <= grid_height/2)
+        in_bounds = (x_local.abs() <= grid_width/2) & (y_local.abs() <= grid_height/2)
         
         candidate_P = P_curr[in_bounds]
         candidate_Hit = Hit[in_bounds]
@@ -154,43 +171,54 @@ def compute_reflections_forward(mesh, source_points, grid_center, grid_normal, g
         y_local = y_local[in_bounds]
         
         # --- F. Visibility Check (Raycasting) ---
-        if check_occlusion and len(candidate_P) > 0:
+        # Convert to numpy for occlusion check logic
+        cand_P_np = candidate_P.numpy()
+        cand_Hit_np = candidate_Hit.numpy()
+        cand_x_np = x_local.numpy()
+        cand_y_np = y_local.numpy()
+
+        if check_occlusion and len(cand_P_np) > 0:
             # 1. Source -> P
-            dirs_s_p = candidate_P - source_point
+            dirs_s_p = cand_P_np - source_point
             dists_s_p = np.linalg.norm(dirs_s_p, axis=1)
             dirs_s_p_norm = dirs_s_p / (dists_s_p[:, np.newaxis] + 1e-6)
             
             rays_s_p = np.concatenate([
-                np.tile(source_point, (len(candidate_P), 1)),
+                np.tile(source_point, (len(cand_P_np), 1)),
                 dirs_s_p_norm
             ], axis=1).astype(np.float32)
             
-            hits_s_p = scene.cast_rays(o3d.core.Tensor(rays_s_p))
+            hits_s_p = scene.cast_rays(o3d.core.Tensor(rays_s_p, device=device))
             t_hit_s_p = hits_s_p['t_hit'].numpy()
             vis_s_p = t_hit_s_p >= (dists_s_p - 1e-3)
             
             # 2. P -> Hit
-            dirs_p_hit = candidate_Hit - candidate_P
+            dirs_p_hit = cand_Hit_np - cand_P_np
             dists_p_hit = np.linalg.norm(dirs_p_hit, axis=1)
             dirs_p_hit_norm = dirs_p_hit / (dists_p_hit[:, np.newaxis] + 1e-6)
             
             rays_p_hit = np.concatenate([
-                candidate_P + dirs_p_hit_norm * 1e-3, # Offset
+                cand_P_np + dirs_p_hit_norm * 1e-3, # Offset
                 dirs_p_hit_norm
             ], axis=1).astype(np.float32)
             
-            hits_p_hit = scene.cast_rays(o3d.core.Tensor(rays_p_hit))
+            hits_p_hit = scene.cast_rays(o3d.core.Tensor(rays_p_hit, device=device))
             t_hit_p_hit = hits_p_hit['t_hit'].numpy()
             vis_p_hit = t_hit_p_hit > (dists_p_hit - 1e-3)
             
             final_mask = vis_s_p & vis_p_hit
         else:
-            final_mask = np.ones(len(candidate_P), dtype=bool)
+            final_mask = np.ones(len(cand_P_np), dtype=bool)
         
-        valid_P = candidate_P[final_mask]
-        valid_Hit = candidate_Hit[final_mask]
-        valid_x = x_local[final_mask]
-        valid_y = y_local[final_mask]
+        # Apply final mask to Tensors for efficient Open3D queries
+        final_mask_t = o3d.core.Tensor(final_mask, device=device)
+        valid_P_t = candidate_P[final_mask_t]
+        
+        # Convert to Numpy for Heatmap and List operations
+        valid_P = valid_P_t.numpy()
+        valid_Hit = candidate_Hit[final_mask_t].numpy()
+        valid_x = x_local[final_mask_t].numpy()
+        valid_y = y_local[final_mask_t].numpy()
         
         # --- G. Map to Heatmap ---
         if len(valid_P) > 0:
@@ -206,20 +234,15 @@ def compute_reflections_forward(mesh, source_points, grid_center, grid_normal, g
             np.add.at(heatmap, (row_idx, col_idx), 1)
             
             # Store paths: (Source, Hit, Bounce)
-            for i in range(len(valid_P)):
-                all_paths.append((source_point, valid_Hit[i], valid_P[i]))
+            # Optimized list extension
+            all_paths.extend([(source_point, h, p) for h, p in zip(valid_Hit, valid_P)])
 
-            # Identify triangles for valid_P
-            dirs = valid_P - source_point
-            dists = np.linalg.norm(dirs, axis=1)
-            dirs /= (dists[:, None] + 1e-6)
-            
-            rays = np.concatenate([np.tile(source_point, (len(valid_P), 1)), dirs], axis=1).astype(np.float32)
-            hits = scene.cast_rays(o3d.core.Tensor(rays))
-            prim_ids = hits['primitive_ids'].numpy()
+            # Identify triangles for valid_P using Closest Point Query (Faster than Raycasting)
+            ans = scene.compute_closest_points(valid_P_t)
+            prim_ids = ans['primitive_ids'].numpy()
             
             # Filter valid hits (Open3D uses 0xFFFFFFFF for invalid)
-            valid_ids = prim_ids[prim_ids != 0xFFFFFFFF]
+            valid_ids = prim_ids[prim_ids != scene.INVALID_ID]
             hit_triangle_indices.update(valid_ids)
     
     print(f"   Confirmed {len(all_paths)} valid paths across all sources.")
