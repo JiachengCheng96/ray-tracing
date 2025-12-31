@@ -70,7 +70,7 @@ def create_pixel_grid(center, normal, up, width, height, resolution_x, resolutio
     
     return grid_points.reshape(-1, 3)
 
-def plot_heatmap(heatmap, save_path=None, title_str='Ray Hits per Pixel'):
+def plot_heatmap(heatmap, save_path=None, title_str='Ray Hits per Pixel', block=True):
     plt.figure(figsize=(6, 5))
     plt.imshow(heatmap, cmap='jet', interpolation='nearest')
     plt.colorbar(label='Hit Count')
@@ -80,8 +80,9 @@ def plot_heatmap(heatmap, save_path=None, title_str='Ray Hits per Pixel'):
     if save_path:
         plt.savefig(save_path)
         print(f"Heatmap saved to {save_path}")
-    plt.show(block=False)
-    plt.pause(0.1)
+    # plt.pause(0.1)
+    # plt.show(block=False)
+    plt.show(block=block)
 
 def create_ground_grid(size=10, step=1.0, y_level=-0.5):
     """Creates a grid of lines to visualize the ground plane."""
