@@ -8,7 +8,7 @@ from utils import load_bunny_mesh, create_pixel_grid, plot_heatmap, create_groun
 
 print(o3d.__version__)
 # print(o3d.__doc__)
-print(o3d.core.get_3rdparty_library_info())
+# print(o3d.core.get_3rdparty_library_info())
 # --- CONFIGURATION ---
 
 num_samples_per_source=10000000
